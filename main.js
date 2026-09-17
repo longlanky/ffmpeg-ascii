@@ -8,6 +8,7 @@ const { chunksToRawFramesOfSize, getFrameSize, MAX_FRAME_BYTES } = require('./li
 const { asciiFromBGRA, stripAnsi } = require('./lib/ascii');
 const { getVideoInfo, decodeBGRAStream, isStillImage } = require('./lib/video');
 const { audioRequested, resolveAudioPlayer, hasAudioStream, spawnAudioPlayer } = require('./lib/audio');
+const { createScheduler } = require('./lib/scheduler');
 
 const CURSOR_HIDE = '\x1b[?25l';
 const CURSOR_SHOW = '\x1b[?25h';
@@ -81,6 +82,8 @@ function writeStdout(chunk) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function renderOnce(input, opts) {
   const info = await getVideoInfo(input, opts);
   const frameSize = getFrameSize(termSize(), { w: info.w, h: info.h }, opts);
@@ -125,6 +128,10 @@ async function playStream(input, opts) {
   }
   const info = await getVideoInfo(input, opts);
 
+  // Presentation scheduler: drop render work when behind, sleep when early.
+  // Decode restarts from frame 0 on resize, so the scheduler resets too.
+  let sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration });
+
   // Still images play as a single rendered frame (unless looping a gif).
   if (isStillImage(info, input) && !opts.loop) {
     if (opts.audio) {
@@ -142,8 +149,8 @@ async function playStream(input, opts) {
   }
 
   let decode = null;
-  let audioProc = null;
-  let audioOn = false;
+  let statsTimer = null;
+  let audioProc = null;  let audioOn = false;
   let audioKillIntended = false;
   let stopped = false;
   let paused = false;
@@ -261,6 +268,10 @@ async function playStream(input, opts) {
       if (key === ' ' || key === 'p') {
         paused = !paused;
         setAudioPaused(paused);
+        if (sched) {
+          if (paused) sched.pause();
+          else sched.resume();
+        }
         process.stderr.write(paused ? '\n[paused — space to resume, q to quit]\n' : '[resumed]\n');
       } else if (key === 'q' || key === '\u0003' || key === '\u001b') {
         stopped = true;
@@ -279,6 +290,12 @@ async function playStream(input, opts) {
     await startAudio();
     if (audioOn) process.stderr.write(`Audio on (${resolveAudioPlayer(opts)}). Sync with video is approximate.\n`);
 
+    if (opts.stats) {
+      statsTimer = setInterval(() => {
+        process.stderr.write(`\r${sched.status()}`);
+      }, 1000);
+    }
+
     let firstSpawn = true;
     while (!stopped) {
       const size = getFrameSize(termSize(), { w: info.w, h: info.h }, opts);
@@ -286,6 +303,9 @@ async function playStream(input, opts) {
         throw new Error(`frame size ${size.w}x${size.h} exceeds memory guard`);
       }
       resizePending = false;
+      // Fresh decode starts at frame 0, so restart presentation timestamps too.
+      sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration });
+      if (paused) sched.pause();
       decode = decodeBGRAStream(input, size, opts);
       const spawnFailed = new Promise((_, reject) => decode.once('error', reject));
       // Surface a missing binary immediately instead of hanging on stdout.
@@ -304,12 +324,19 @@ async function playStream(input, opts) {
       });
 
       try {
+        let frameIndex = 0;
         for await (const frame of dechunk(decode.stdout)) {
           if (stopped || resizePending) break;
           while (paused && !stopped) {
             await new Promise((r) => setTimeout(r, 100));
           }
           if (stopped || resizePending) break;
+          const decision = sched.decide(frameIndex++);
+          if (decision.action === 'drop') continue; // behind: skip render+write
+          if (decision.waitMs > 0) {
+            await sleep(decision.waitMs);
+            if (stopped || resizePending) break;
+          }
           const ascii = asciiFromBGRA(frame, size.w, {
             chars: opts.chars,
             colored: opts.color,
@@ -353,6 +380,10 @@ async function playStream(input, opts) {
     }
   } finally {
     clearTimeout(resizeTimer);
+    if (statsTimer) {
+      clearInterval(statsTimer);
+      process.stderr.write(`\r${sched.status()}\n`);
+    }
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigint);
     if (display && stdoutIsTTY) process.stdout.removeListener('resize', debouncedResize);
@@ -379,6 +410,7 @@ addSharedOptions(program.command('play <input>'))
   .option('--audio', 'play audio via a companion player (ffplay by default)')
   .option('--audio-player <path>', 'audio player binary: ffplay or mpv (or AUDIO_PLAYER env)')
   .option('--volume <n>', 'audio volume 0..100 (player default when omitted)')
+  .option('--stats', 'show playback progress and effective fps on stderr')
   .action(async (input, cmdOpts) => {
     try {
       const opts = resolveRenderOptions(cmdOpts);

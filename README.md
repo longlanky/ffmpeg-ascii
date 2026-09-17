@@ -33,7 +33,7 @@ Common options (both commands):
 | `--no-fit` | fit | use raw terminal size |
 | `--ffmpeg/--ffprobe <path>` | PATH / env | override binaries (`FFMPEG_PATH`, `FFPROBE_PATH`) |
 
-`play` extras: `--loop`, `--output <file>` (plain-text frames, form-feed separated), `--no-display` (requires `--output`), `--audio` (see below).
+`play` extras: `--loop`, `--output <file>` (plain-text frames, form-feed separated), `--no-display` (requires `--output`), `--audio` (see below), `--stats` (progress + effective fps on stderr).
 `render` extras: `--output <file>` writes the frame instead of stdout.
 
 ### Audio
@@ -59,6 +59,8 @@ node main.js play clip.mp4 --output frames.txt --no-display
 ```
 
 Playback keys (interactive terminal): `space` pause/resume, `q` quit. Resizing the terminal respawns the decoder at the new size (restarts from the beginning).
+
+Playback stays on pace with the source: frames more than one frame-duration late are dropped (not rendered) so slow terminals can't accumulate lag — `--stats` shows `elapsed/total · effective fps · rendered (dropped N)`. Pause freezes presentation timestamps, so resume doesn't mass-drop.
 
 ### Development
 
