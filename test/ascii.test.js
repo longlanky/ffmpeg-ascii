@@ -71,6 +71,11 @@ test('dither cannot push extremes off the ramp ends', () => {
   assert.equal(asciiFromBGRA(white, 1, { colored: false, dither: true }), DEFAULT_CHARS.at(-1));
 });
 
+test('stripAnsi removes SGR colors and cursor addressing', () => {
+  assert.equal(stripAnsi('\x1b[38;2;1;2;3m@\x1b[39m'), '@');
+  assert.equal(stripAnsi('\x1b[12;40Hhello'), 'hello');
+});
+
 test('brightness extremes saturate the ramp', () => {
   const black = Buffer.from(px(0, 0, 0));
   const white = Buffer.from(px(255, 255, 255));

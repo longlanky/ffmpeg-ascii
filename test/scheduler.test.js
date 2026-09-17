@@ -28,6 +28,26 @@ test('unpaced scheduler renders everything with no wait', () => {
   assert.equal(s.dropped, 0);
 });
 
+test('clock starts on first frame, not construction', () => {
+  const clock = fakeClock();
+  const s = createScheduler({ fps: 10, clock });
+  clock.advance(5000); // spawn + decoder startup latency
+  assert.deepEqual(s.decide(0), { action: 'render', waitMs: 0 });
+  assert.equal(s.dropped, 0);
+  clock.advance(100);
+  assert.deepEqual(s.decide(1), { action: 'render', waitMs: 0 });
+});
+
+test('pre-start pause does not shift the anchored clock', () => {
+  const clock = fakeClock();
+  const s = createScheduler({ fps: 10, clock });
+  s.pause();
+  clock.advance(5000);
+  s.resume();
+  assert.deepEqual(s.decide(0), { action: 'render', waitMs: 0 });
+  assert.equal(s.dropped, 0);
+});
+
 test('on-time frames render with no wait', () => {
   const clock = fakeClock();
   const s = createScheduler({ fps: 10, clock }); // 100ms frames

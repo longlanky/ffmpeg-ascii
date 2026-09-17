@@ -63,6 +63,8 @@ Playback keys (interactive terminal): `space` pause/resume, `q` quit. Resizing t
 
 Playback stays on pace with the source: frames more than one frame-duration late are dropped (not rendered) so slow terminals can't accumulate lag — `--stats` shows `elapsed/total · effective fps · rendered (dropped N)`. Pause freezes presentation timestamps, so resume doesn't mass-drop.
 
+Only changed cells are repainted each frame (cursor-addressed delta redraw — ~65% fewer bytes on typical content); a mostly-changed frame falls back to a full repaint automatically. `--no-diff` forces full repaints.
+
 ### Development
 
 ```sh

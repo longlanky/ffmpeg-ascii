@@ -5,7 +5,8 @@ const fs = require('fs');
 const { program } = require('commander');
 const pkg = require('./package.json');
 const { chunksToRawFramesOfSize, getFrameSize, MAX_FRAME_BYTES } = require('./lib/frames');
-const { asciiFromBGRA, stripAnsi } = require('./lib/ascii');
+const { asciiFromBGRA, cellsFromBGRA, cellsToString, stripAnsi } = require('./lib/ascii');
+const { diffGrids, runsToAnsi } = require('./lib/diff');
 const { getVideoInfo, decodeBGRAStream, isStillImage } = require('./lib/video');
 const { audioRequested, resolveAudioPlayer, hasAudioStream, spawnAudioPlayer } = require('./lib/audio');
 const { createScheduler } = require('./lib/scheduler');
@@ -85,6 +86,20 @@ function writeStdout(chunk) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Above this changed-cell ratio, a delta costs more than a full redraw.
+const FULL_REDRAW_RATIO = 0.6;
+
+function asciiOptsFor(opts) {
+  return {
+    chars: opts.chars,
+    colored: opts.color,
+    reverse: opts.invert,
+    dither: opts.dither,
+    contrast: opts.contrast,
+    brightness: opts.brightness,
+  };
+}
+
 async function renderOnce(input, opts) {
   const info = await getVideoInfo(input, opts);
   const frameSize = getFrameSize(termSize(), { w: info.w, h: info.h }, opts);
@@ -111,14 +126,7 @@ async function renderOnce(input, opts) {
     const tail = decode.decodeStderr ? decode.decodeStderr() : '';
     throw new Error(`no frames decoded${tail ? `: ${tail}` : ''}`);
   }
-  const ascii = asciiFromBGRA(frame, frameSize.w, {
-    chars: opts.chars,
-    colored: opts.color,
-    reverse: opts.invert,
-    dither: opts.dither,
-    contrast: opts.contrast,
-    brightness: opts.brightness,
-  });
+  const ascii = asciiFromBGRA(frame, frameSize.w, asciiOptsFor(opts));
   return { ascii, frameSize, info };
 }
 
@@ -158,6 +166,15 @@ async function playStream(input, opts) {
   let paused = false;
   let resizePending = false;
   let frames = 0;
+  // Delta redraw state: previous cell grid + last changed-cell % for --stats.
+  // File output always gets full frames; diffs only drive the terminal.
+  const useDiff = display && opts.diff !== false;
+  let prevGrid = null;
+  const diffStats = { pct: null };
+  const statsLine = () => {
+    const base = sched.status();
+    return diffStats.pct == null ? base : `${base} · chg ${diffStats.pct}%`;
+  };
   const stdin = process.stdin;
   const stdinWasRaw = Boolean(stdin.isTTY && stdin.isRaw);
   const stdoutIsTTY = Boolean(process.stdout.isTTY);
@@ -294,7 +311,7 @@ async function playStream(input, opts) {
 
     if (opts.stats) {
       statsTimer = setInterval(() => {
-        process.stderr.write(`\r${sched.status()}`);
+        process.stderr.write(`\r${statsLine()}`);
       }, 1000);
     }
 
@@ -305,8 +322,9 @@ async function playStream(input, opts) {
         throw new Error(`frame size ${size.w}x${size.h} exceeds memory guard`);
       }
       resizePending = false;
-      // Fresh decode starts at frame 0, so restart presentation timestamps too.
+      // Fresh decode starts at frame 0: restart timestamps and force a full draw.
       sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration });
+      prevGrid = null;
       if (paused) sched.pause();
       decode = decodeBGRAStream(input, size, opts);
       const spawnFailed = new Promise((_, reject) => decode.once('error', reject));
@@ -339,19 +357,35 @@ async function playStream(input, opts) {
             await sleep(decision.waitMs);
             if (stopped || resizePending) break;
           }
-          const ascii = asciiFromBGRA(frame, size.w, {
-            chars: opts.chars,
-            colored: opts.color,
-            reverse: opts.invert,
-            dither: opts.dither,
-            contrast: opts.contrast,
-            brightness: opts.brightness,
-          });
+          const asciiOpts = asciiOptsFor(opts);
+          const colored = opts.color !== false;
+          let grid = null;
+          const getGrid = () => (grid ??= cellsFromBGRA(frame, size.w, asciiOpts));
           if (display) {
-            writeStdout(`${CURSOR_HOME}${ascii}`);
+            if (useDiff) {
+              const g = getGrid();
+              if (prevGrid && prevGrid.width === g.width && prevGrid.height === g.height) {
+                const d = diffGrids(prevGrid, g);
+                diffStats.pct = d.total === 0 ? 0 : Math.round((d.changed / d.total) * 100);
+                if (d.changed === 0) {
+                  // Screen already shows this frame — nothing to write.
+                } else if (d.changed / d.total > FULL_REDRAW_RATIO) {
+                  writeStdout(`${CURSOR_HOME}${cellsToString(g, colored)}`);
+                } else {
+                  writeStdout(runsToAnsi(d.runs, colored));
+                }
+              } else {
+                writeStdout(`${CURSOR_HOME}${cellsToString(g, colored)}`);
+                diffStats.pct = 100;
+              }
+              prevGrid = g;
+            } else {
+              writeStdout(`${CURSOR_HOME}${asciiFromBGRA(frame, size.w, asciiOpts)}`);
+            }
           }
           if (outFd) {
-            await outFd.write(`${stripAnsi(ascii)}\n\x0c\n`);
+            const text = grid ? cellsToString(grid, colored) : asciiFromBGRA(frame, size.w, asciiOpts);
+            await outFd.write(`${stripAnsi(text)}\n\x0c\n`);
           }
           frames++;
           void firstSpawn;
@@ -385,7 +419,7 @@ async function playStream(input, opts) {
     clearTimeout(resizeTimer);
     if (statsTimer) {
       clearInterval(statsTimer);
-      process.stderr.write(`\r${sched.status()}\n`);
+      process.stderr.write(`\r${statsLine()}\n`);
     }
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigint);
@@ -414,6 +448,7 @@ addSharedOptions(program.command('play <input>'))
   .option('--audio-player <path>', 'audio player binary: ffplay or mpv (or AUDIO_PLAYER env)')
   .option('--volume <n>', 'audio volume 0..100 (player default when omitted)')
   .option('--stats', 'show playback progress and effective fps on stderr')
+  .option('--no-diff', 'disable delta redraw (repaint every frame fully)')
   .action(async (input, cmdOpts) => {
     try {
       const opts = resolveRenderOptions(cmdOpts);
