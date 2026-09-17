@@ -7,6 +7,7 @@ const pkg = require('./package.json');
 const { chunksToRawFramesOfSize, getFrameSize, MAX_FRAME_BYTES } = require('./lib/frames');
 const { asciiFromBGRA, stripAnsi } = require('./lib/ascii');
 const { getVideoInfo, decodeBGRAStream, isStillImage } = require('./lib/video');
+const { audioRequested, resolveAudioPlayer, hasAudioStream, spawnAudioPlayer } = require('./lib/audio');
 
 const CURSOR_HIDE = '\x1b[?25l';
 const CURSOR_SHOW = '\x1b[?25h';
@@ -61,6 +62,14 @@ function resolveRenderOptions(cmdOpts) {
   if (o.chars != null && String(o.chars).length < 2) throw new Error('chars must contain at least 2 characters');
   o.ffmpegPath = o.ffmpeg || process.env.FFMPEG_PATH || undefined;
   o.ffprobePath = o.ffprobe || process.env.FFPROBE_PATH || undefined;
+  // Any audio flag implies --audio (explicit player or volume = intent to hear sound).
+  if (o.volume != null) {
+    const v = Number(o.volume);
+    if (!Number.isFinite(v) || v < 0 || v > 100) throw new Error(`volume must be in 0..100 (got ${o.volume})`);
+    o.volume = v;
+  }
+  o.audioPlayer = o.audioPlayer || undefined;
+  o.audio = audioRequested(o);
   return o;
 }
 
@@ -118,6 +127,9 @@ async function playStream(input, opts) {
 
   // Still images play as a single rendered frame (unless looping a gif).
   if (isStillImage(info, input) && !opts.loop) {
+    if (opts.audio) {
+      process.stderr.write('Warning: --audio is only supported for video; ignoring for still image.\n');
+    }
     const { ascii } = await renderOnce(input, opts);
     if (display) writeStdout(`${ascii}\n`);
     if (needOutput) await fs.promises.writeFile(opts.output, `${stripAnsi(ascii)}\n`);
@@ -130,6 +142,9 @@ async function playStream(input, opts) {
   }
 
   let decode = null;
+  let audioProc = null;
+  let audioOn = false;
+  let audioKillIntended = false;
   let stopped = false;
   let paused = false;
   let resizePending = false;
@@ -146,6 +161,68 @@ async function playStream(input, opts) {
     }
   };
 
+  // Audio runs for the whole session (independent of video resize respawns).
+  const killAudio = (sig = 'SIGTERM') => {
+    if (audioProc && audioProc.exitCode == null && !audioProc.killed) {
+      try {
+        audioProc.kill(sig);
+        audioKillIntended = true; // ffplay maps SIGTERM to exit 123 — not a failure
+      } catch { /* already gone */ }
+    }
+  };
+
+  const setAudioPaused = (pause) => {
+    if (!audioProc || process.platform === 'win32') return;
+    try {
+      audioProc.kill(pause ? 'SIGSTOP' : 'SIGCONT');
+    } catch { /* exited already */ }
+  };
+
+  const startAudio = async () => {
+    if (!opts.audio) return;
+    let has = false;
+    try {
+      has = await hasAudioStream(input, opts);
+    } catch (err) {
+      process.stderr.write(`Warning: audio probe failed (${err.message}); playing silently.\n`);
+      return;
+    }
+    if (!has) {
+      process.stderr.write('Warning: no audio stream found; playing silently.\n');
+      return;
+    }
+    try {
+      audioProc = spawnAudioPlayer(input, opts);
+      await new Promise((resolve, reject) => {
+        audioProc.once('spawn', resolve);
+        audioProc.once('error', reject);
+      });
+    } catch (err) {
+      audioProc = null;
+      if (err && err.code === 'ENOENT') {
+        throw new Error(
+          `audio player '${resolveAudioPlayer(opts)}' not found (install ffplay or pass --audio-player <path>)`
+        );
+      }
+      throw err;
+    }
+    audioOn = true;
+    if (paused) setAudioPaused(true);
+    audioProc.on('error', (err) => {
+      if (!stopped) process.stderr.write(`Warning: audio player error (${err.message}).\n`);
+    });
+    audioProc.on('close', (code) => {
+      // Ignore our own cleanup kills; a real non-zero exit means the player
+      // failed on its own (e.g. no audio device) — say so.
+      if (!stopped && !audioKillIntended && code !== 0 && code != null) {
+        const tail = audioProc.audioStderr ? audioProc.audioStderr() : '';
+        process.stderr.write(
+          `Warning: audio player exited with code ${code}${tail ? `: ${tail}` : ''}.\n`
+        );
+      }
+    });
+  };
+
   const cleanupDisplay = () => {
     if (display && stdoutIsTTY) writeStdout(CURSOR_SHOW);
     if (stdin.isTTY && typeof stdin.setRawMode === 'function') {
@@ -159,6 +236,7 @@ async function playStream(input, opts) {
   const onSigint = () => {
     stopped = true;
     killDecode();
+    killAudio();
   };
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigint);
@@ -182,10 +260,12 @@ async function playStream(input, opts) {
     stdin.on('data', (key) => {
       if (key === ' ' || key === 'p') {
         paused = !paused;
+        setAudioPaused(paused);
         process.stderr.write(paused ? '\n[paused — space to resume, q to quit]\n' : '[resumed]\n');
       } else if (key === 'q' || key === '\u0003' || key === '\u001b') {
         stopped = true;
         killDecode();
+        killAudio();
       }
     });
   }
@@ -196,6 +276,8 @@ async function playStream(input, opts) {
       else writeStdout(CURSOR_HOME);
       process.stderr.write('Playing — space pauses, q quits.\n');
     }
+    await startAudio();
+    if (audioOn) process.stderr.write(`Audio on (${resolveAudioPlayer(opts)}). Sync with video is approximate.\n`);
 
     let firstSpawn = true;
     while (!stopped) {
@@ -276,6 +358,7 @@ async function playStream(input, opts) {
     if (display && stdoutIsTTY) process.stdout.removeListener('resize', debouncedResize);
     if (stdin.isTTY) stdin.removeAllListeners('data');
     killDecode();
+    killAudio();
     cleanupDisplay();
     if (outFd) await outFd.close().catch(() => {});
     if (display) writeStdout('\n');
@@ -293,6 +376,9 @@ addSharedOptions(program.command('play <input>'))
   .option('--loop', 'loop the input indefinitely')
   .option('--output <file>', 'also append plain-text frames to a file (form-feed separated)')
   .option('--no-display', 'do not draw to the terminal (requires --output)')
+  .option('--audio', 'play audio via a companion player (ffplay by default)')
+  .option('--audio-player <path>', 'audio player binary: ffplay or mpv (or AUDIO_PLAYER env)')
+  .option('--volume <n>', 'audio volume 0..100 (player default when omitted)')
   .action(async (input, cmdOpts) => {
     try {
       const opts = resolveRenderOptions(cmdOpts);

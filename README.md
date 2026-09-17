@@ -33,8 +33,20 @@ Common options (both commands):
 | `--no-fit` | fit | use raw terminal size |
 | `--ffmpeg/--ffprobe <path>` | PATH / env | override binaries (`FFMPEG_PATH`, `FFPROBE_PATH`) |
 
-`play` extras: `--loop`, `--output <file>` (plain-text frames, form-feed separated), `--no-display` (requires `--output`).
+`play` extras: `--loop`, `--output <file>` (plain-text frames, form-feed separated), `--no-display` (requires `--output`), `--audio` (see below).
 `render` extras: `--output <file>` writes the frame instead of stdout.
+
+### Audio
+
+`play` can play sound alongside the ASCII video via a companion player (video stays the timing source; sync is approximate):
+
+```sh
+node main.js play clip.mp4 --audio
+node main.js play clip.mp4 --audio --volume 50
+node main.js play clip.mp4 --audio --audio-player mpv   # or AUDIO_PLAYER env
+```
+
+`--audio-player`/`--volume` imply `--audio`. Files without an audio stream print a warning and play silently. Pause (`space`) suspends the audio process too (SIGSTOP/SIGCONT, POSIX only). Still images ignore `--audio` with a warning.
 
 Examples:
 
