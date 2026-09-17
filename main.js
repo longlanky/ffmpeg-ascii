@@ -44,6 +44,7 @@ function addSharedOptions(cmd) {
     .option('--color', 'ANSI truecolor output (default)', true)
     .option('--no-color', 'plain ASCII without color codes')
     .option('--invert', 'reverse the character ramp (negative image)')
+    .option('--dither', 'Bayer ordered dithering (less banding, more texture)')
     .option('--contrast <n>', 'contrast multiplier, (0, 5] (default: 1)', '1')
     .option('--brightness <n>', 'brightness offset per channel, -255..255 (default: 0)', '0')
     .option('--char-aspect <n>', 'character cell height/width ratio override')
@@ -114,6 +115,7 @@ async function renderOnce(input, opts) {
     chars: opts.chars,
     colored: opts.color,
     reverse: opts.invert,
+    dither: opts.dither,
     contrast: opts.contrast,
     brightness: opts.brightness,
   });
@@ -341,6 +343,7 @@ async function playStream(input, opts) {
             chars: opts.chars,
             colored: opts.color,
             reverse: opts.invert,
+            dither: opts.dither,
             contrast: opts.contrast,
             brightness: opts.brightness,
           });

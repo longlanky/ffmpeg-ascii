@@ -27,6 +27,7 @@ Common options (both commands):
 | `--chars <string>` | `" .,:;i1tfLCG08@"` | dark → bright ramp |
 | `--color` / `--no-color` | color | ANSI truecolor foreground per character |
 | `--invert` | off | reverse ramp (negative image) |
+| `--dither` | off | Bayer ordered dithering (less banding, more texture) |
 | `--contrast <n>` | `1` | range (0, 5] |
 | `--brightness <n>` | `0` | per-channel offset -255..255 |
 | `--char-aspect <n>` | `~0.43` | character cell ratio override |
