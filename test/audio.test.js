@@ -63,3 +63,13 @@ test('buildAudioArgs rejects unknown players and bad input', () => {
   assert.throws(() => buildAudioArgs('', {}), /input path required/);
   assert.throws(() => buildAudioArgs('clip.mp4', { volume: 500 }), /volume/);
 });
+
+test('buildAudioArgs seek starts partway through', () => {
+  assert.deepEqual(buildAudioArgs('clip.mp4', { seek: 7.5 }).args, [
+    '-nodisp', '-autoexit', '-loglevel', 'error', '-ss', '7.5', 'clip.mp4',
+  ]);
+  assert.deepEqual(buildAudioArgs('clip.mp4', { audioPlayer: 'mpv', seek: 7.5 }).args, [
+    '--no-video', '--really-quiet', '--start=7.5', 'clip.mp4',
+  ]);
+  assert.throws(() => buildAudioArgs('clip.mp4', { seek: -2 }), /seek/);
+});

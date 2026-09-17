@@ -7,6 +7,7 @@ const {
   parseFps,
   isStillImage,
   buildVideoFilter,
+  buildDecodeArgs,
 } = require('../lib/video');
 
 const probeDoc = (stream) => JSON.stringify({ streams: [stream] });
@@ -61,4 +62,16 @@ test('buildVideoFilter composes scale and fps', () => {
   );
   assert.throws(() => buildVideoFilter({ w: 80, h: 24 }, { fps: 0 }), /fps/);
   assert.throws(() => buildVideoFilter({ w: 80 }, {}), /frameSize/);
+});
+
+test('buildDecodeArgs places seek before input, loop/realtime around it', () => {
+  const args = buildDecodeArgs('clip.mp4', { w: 80, h: 24 }, {});
+  assert.deepEqual(args.slice(0, 4), ['-hide_banner', '-loglevel', 'error', '-re']);
+  assert.ok(args.includes('-i') && args.includes('clip.mp4'));
+  const seekArgs = buildDecodeArgs('clip.mp4', { w: 80, h: 24 }, { seek: 12.5 });
+  const ss = seekArgs.indexOf('-ss');
+  assert.ok(ss !== -1 && seekArgs[ss + 1] === '12.5' && ss < seekArgs.indexOf('-i'));
+  assert.deepEqual(buildDecodeArgs('c', { w: 1, h: 1 }, { seek: 0 }), buildDecodeArgs('c', { w: 1, h: 1 }, {}));
+  assert.throws(() => buildDecodeArgs('c', { w: 1, h: 1 }, { seek: -1 }), /seek/);
+  assert.throws(() => buildDecodeArgs('', { w: 1, h: 1 }, {}), /video path required/);
 });

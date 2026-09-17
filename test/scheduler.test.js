@@ -112,3 +112,13 @@ test('status without duration shows placeholder', () => {
   const s = createScheduler({ fps: 5 });
   assert.match(s.status(), /--:--/);
 });
+
+test('offset shifts elapsed and status (seek position)', () => {
+  const clock = fakeClock();
+  const s = createScheduler({ fps: 10, duration: 90, offset: 30, clock });
+  assert.equal(s.elapsed(), 30);
+  s.decide(0);
+  clock.advance(2000);
+  assert.equal(s.elapsed(), 32);
+  assert.match(s.status(), /00:32\/01:30/);
+});

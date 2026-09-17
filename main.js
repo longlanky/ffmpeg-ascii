@@ -9,7 +9,8 @@ const { asciiFromBGRA, cellsFromBGRA, halfCellsFromBGRA, cellsToString, stripAns
 const { diffGrids, runsToAnsi } = require('./lib/diff');
 const { getVideoInfo, decodeBGRAStream, isStillImage } = require('./lib/video');
 const { audioRequested, resolveAudioPlayer, hasAudioStream, spawnAudioPlayer } = require('./lib/audio');
-const { createScheduler } = require('./lib/scheduler');
+const { createScheduler, formatTime } = require('./lib/scheduler');
+const { createKeyParser, SEEK_SECONDS } = require('./lib/keys');
 
 const CURSOR_HIDE = '\x1b[?25l';
 const CURSOR_SHOW = '\x1b[?25h';
@@ -178,6 +179,9 @@ async function playStream(input, opts) {
   let stopped = false;
   let paused = false;
   let resizePending = false;
+  let seekPending = false;
+  let seekOffset = 0; // seconds: absolute position decode/audio (re)start from
+  let audioAvailable = false;
   let frames = 0;
   // Delta redraw state: previous cell grid + last changed-cell % for --stats.
   // File output always gets full frames; diffs only drive the terminal.
@@ -230,8 +234,16 @@ async function playStream(input, opts) {
       process.stderr.write('Warning: no audio stream found; playing silently.\n');
       return;
     }
+    audioAvailable = true;
+    await spawnAudioOnly();
+  };
+
+  // Spawn (or respawn, after a seek) the companion player at seekOffset.
+  // No re-probe: the caller already knows audio exists.
+  const spawnAudioOnly = async () => {
+    audioKillIntended = false;
     try {
-      audioProc = spawnAudioPlayer(input, opts);
+      audioProc = spawnAudioPlayer(input, { ...opts, seek: seekOffset });
       await new Promise((resolve, reject) => {
         audioProc.once('spawn', resolve);
         audioProc.once('error', reject);
@@ -260,6 +272,29 @@ async function playStream(input, opts) {
         );
       }
     });
+  };
+
+  // Relative seek: restart video decode and audio together at the new offset.
+  // Video respawn flows through seekPending like a resize; audio restarts here.
+  const doSeek = (delta) => {
+    if (stopped) return;
+    // sched.elapsed() already includes the current seek offset.
+    const position = sched ? sched.elapsed() : seekOffset;
+    let target = position + delta;
+    if (info.duration != null) {
+      target = Math.min(target, Math.max(0, info.duration - 0.5));
+    }
+    target = Math.max(0, target);
+    seekOffset = Math.round(target * 1000) / 1000;
+    seekPending = true;
+    killDecode();
+    if (opts.audio && audioAvailable) {
+      killAudio();
+      spawnAudioOnly().catch((err) => {
+        process.stderr.write(`Warning: audio restart failed (${err.message}).\n`);
+      });
+    }
+    process.stderr.write(`\n[seek ${delta > 0 ? '+' : ''}${delta}s → ${formatTime(target)}]\n`);
   };
 
   const cleanupDisplay = () => {
@@ -296,8 +331,8 @@ async function playStream(input, opts) {
     stdin.setRawMode(true);
     stdin.resume();
     stdin.setEncoding('utf8');
-    stdin.on('data', (key) => {
-      if (key === ' ' || key === 'p') {
+    const keys = createKeyParser((action) => {
+      if (action === 'togglePause') {
         paused = !paused;
         setAudioPaused(paused);
         if (sched) {
@@ -305,19 +340,24 @@ async function playStream(input, opts) {
           else sched.resume();
         }
         process.stderr.write(paused ? '\n[paused — space to resume, q to quit]\n' : '[resumed]\n');
-      } else if (key === 'q' || key === '\u0003' || key === '\u001b') {
+      } else if (action === 'quit') {
         stopped = true;
         killDecode();
         killAudio();
+      } else if (action === 'seekBack') {
+        doSeek(-SEEK_SECONDS);
+      } else if (action === 'seekFwd') {
+        doSeek(SEEK_SECONDS);
       }
     });
+    stdin.on('data', (key) => keys.push(key));
   }
 
   try {
     if (display) {
       if (stdoutIsTTY) writeStdout(CLEAR_SCREEN + CURSOR_HIDE);
       else writeStdout(CURSOR_HOME);
-      process.stderr.write('Playing — space pauses, q quits.\n');
+      process.stderr.write('Playing — space pauses, q quits, ←/→ seek 5s.\n');
     }
     await startAudio();
     if (audioOn) process.stderr.write(`Audio on (${resolveAudioPlayer(opts)}). Sync with video is approximate.\n`);
@@ -336,11 +376,13 @@ async function playStream(input, opts) {
         throw new Error(`frame size ${decodeSize.w}x${decodeSize.h} exceeds memory guard`);
       }
       resizePending = false;
-      // Fresh decode starts at frame 0: restart timestamps and force a full draw.
-      sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration });
+      seekPending = false;
+      // Fresh decode starts at seekOffset: restart timestamps (with position
+      // offset for --stats) and force a full draw.
+      sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration, offset: seekOffset });
       prevGrid = null;
       if (paused) sched.pause();
-      decode = decodeBGRAStream(input, decodeSize, opts);
+      decode = decodeBGRAStream(input, decodeSize, { ...opts, seek: seekOffset });
       const spawnFailed = new Promise((_, reject) => decode.once('error', reject));
       // Surface a missing binary immediately instead of hanging on stdout.
       await Promise.race([
@@ -360,16 +402,16 @@ async function playStream(input, opts) {
       try {
         let frameIndex = 0;
         for await (const frame of dechunk(decode.stdout)) {
-          if (stopped || resizePending) break;
+          if (stopped || resizePending || seekPending) break;
           while (paused && !stopped) {
             await new Promise((r) => setTimeout(r, 100));
           }
-          if (stopped || resizePending) break;
+          if (stopped || resizePending || seekPending) break;
           const decision = sched.decide(frameIndex++);
           if (decision.action === 'drop') continue; // behind: skip render+write
           if (decision.waitMs > 0) {
             await sleep(decision.waitMs);
-            if (stopped || resizePending) break;
+            if (stopped || resizePending || seekPending) break;
           }
           const asciiOpts = asciiOptsFor(opts);
           const colored = opts.color !== false;
@@ -429,8 +471,8 @@ async function playStream(input, opts) {
         }, 5000);
       }).catch(() => null);
 
-      if (stopped && !resizePending) break;
-      if (resizePending && !stopped) continue; // respawn at new terminal size
+      if (stopped && !resizePending && !seekPending) break;
+      if ((resizePending || seekPending) && !stopped) continue; // respawn (new size or seek)
       if (exitCode !== 0 && exitCode != null) {
         const tail = decode.decodeStderr ? decode.decodeStderr() : '';
         throw new Error(`ffmpeg exited with code ${exitCode}${tail ? `: ${tail}` : ''}`);

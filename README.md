@@ -60,7 +60,7 @@ node main.js render photo.png --width 80 > frame.txt
 node main.js play clip.mp4 --output frames.txt --no-display
 ```
 
-Playback keys (interactive terminal): `space` pause/resume, `q` quit. Resizing the terminal respawns the decoder at the new size (restarts from the beginning).
+Playback keys (interactive terminal): `space` pause/resume, `q` quit, `←`/`→` seek ∓5s. Resizing the terminal respawns the decoder at the new size (restarts from the beginning).
 
 Playback stays on pace with the source: frames more than one frame-duration late are dropped (not rendered) so slow terminals can't accumulate lag — `--stats` shows `elapsed/total · effective fps · rendered (dropped N)`. Pause freezes presentation timestamps, so resume doesn't mass-drop.
 
