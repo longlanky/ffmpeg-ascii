@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { asciiFromBGRA, stripAnsi, DEFAULT_CHARS } = require('../lib/ascii');
+const { asciiFromBGRA, cellsFromBGRA, halfCellsFromBGRA, cellsToString, stripAnsi, DEFAULT_CHARS } = require('../lib/ascii');
 
 const px = (r, g, b) => [b, g, r, 255];
 
@@ -34,7 +34,7 @@ test('rows are joined with newlines, no trailing newline', () => {
 test('colored output wraps each char in truecolor ANSI', () => {
   const buf = Buffer.from(px(10, 20, 30));
   const out = asciiFromBGRA(buf, 1, { colored: true });
-  assert.match(out, /^\x1b\[38;2;10;20;30m.\x1b\[39m$/);
+  assert.match(out, /^\x1b\[38;2;10;20;30m.\x1b\[0m$/);
   assert.equal(stripAnsi(out).length, 1);
 });
 
@@ -42,8 +42,8 @@ test('same-color runs share one SGR code with a single trailing reset', () => {
   const buf = Buffer.from([...px(10, 20, 30), ...px(10, 20, 30), ...px(10, 20, 30)]);
   const out = asciiFromBGRA(buf, 3, { colored: true });
   assert.equal(out.match(/\x1b\[38;2;/g).length, 1);
-  assert.equal(out.match(/\x1b\[39m/g).length, 1);
-  assert.ok(out.endsWith('\x1b[39m'));
+  assert.equal(out.match(/\x1b\[0m/g).length, 1);
+  assert.ok(out.endsWith('\x1b[0m'));
   assert.equal(stripAnsi(out).length, 3);
 });
 
@@ -64,6 +64,34 @@ test('dither is off by default and deterministic when on', () => {
   assert.ok(a.includes('0') && a.includes('1'), `expected mixed dither texture, got ${JSON.stringify(a)}`);
 });
 
+test('half-blocks pair two rows per cell (fg=top, bg=bottom)', () => {
+  const buf = Buffer.from([...px(255, 0, 0), ...px(0, 0, 255)]);
+  const g = halfCellsFromBGRA(buf, 1);
+  assert.equal(g.width, 1);
+  assert.equal(g.height, 1);
+  assert.deepEqual(g.chars, ['▀']);
+  assert.deepEqual([...g.colors], [255, 0, 0]);
+  assert.deepEqual([...g.bg], [0, 0, 255]);
+  const out = cellsToString(g, true);
+  assert.match(out, /^\x1b\[38;2;255;0;0m\x1b\[48;2;0;0;255m▀\x1b\[0m$/);
+  assert.equal(stripAnsi(out), '▀');
+});
+
+test('half-blocks halve the row count and handle odd rows', () => {
+  const row = [...px(10, 10, 10), ...px(20, 20, 20)];
+  const buf = Buffer.from([...row, ...row, ...row]); // 3 pixel rows x2 cols
+  const g = halfCellsFromBGRA(buf, 2);
+  assert.equal(g.height, 2); // ceil(3/2); dangling row pairs with itself
+  assert.deepEqual([...g.bg.slice(-3)], [20, 20, 20]);
+});
+
+test('half-blocks reject bad input', () => {
+  assert.throws(() => halfCellsFromBGRA('nope', 2), /must be a Buffer/);
+  assert.throws(() => halfCellsFromBGRA(Buffer.alloc(8), 0), /frameWidth/);
+  assert.throws(() => halfCellsFromBGRA(Buffer.from([1, 2, 3]), 2), /whole number/);
+});
+  const black = Buffer.from(px(0, 0, 0));
+  const white = Buffer.from(px(255, 255, 255));
 test('dither cannot push extremes off the ramp ends', () => {
   const black = Buffer.from(px(0, 0, 0));
   const white = Buffer.from(px(255, 255, 255));
@@ -72,7 +100,7 @@ test('dither cannot push extremes off the ramp ends', () => {
 });
 
 test('stripAnsi removes SGR colors and cursor addressing', () => {
-  assert.equal(stripAnsi('\x1b[38;2;1;2;3m@\x1b[39m'), '@');
+  assert.equal(stripAnsi('\x1b[38;2;1;2;3m@\x1b[0m'), '@');
   assert.equal(stripAnsi('\x1b[12;40Hhello'), 'hello');
 });
 

@@ -4,8 +4,8 @@
 const fs = require('fs');
 const { program } = require('commander');
 const pkg = require('./package.json');
-const { chunksToRawFramesOfSize, getFrameSize, MAX_FRAME_BYTES } = require('./lib/frames');
-const { asciiFromBGRA, cellsFromBGRA, cellsToString, stripAnsi } = require('./lib/ascii');
+const { chunksToRawFramesOfSize, getFrameSize, DEFAULT_CHAR_ASPECT, MAX_FRAME_BYTES } = require('./lib/frames');
+const { asciiFromBGRA, cellsFromBGRA, halfCellsFromBGRA, cellsToString, stripAnsi } = require('./lib/ascii');
 const { diffGrids, runsToAnsi } = require('./lib/diff');
 const { getVideoInfo, decodeBGRAStream, isStillImage } = require('./lib/video');
 const { audioRequested, resolveAudioPlayer, hasAudioStream, spawnAudioPlayer } = require('./lib/audio');
@@ -46,6 +46,7 @@ function addSharedOptions(cmd) {
     .option('--no-color', 'plain ASCII without color codes')
     .option('--invert', 'reverse the character ramp (negative image)')
     .option('--dither', 'Bayer ordered dithering (less banding, more texture)')
+    .option('--half-blocks', 'hi-density cells: pair 2 pixel rows via half-blocks (needs color)')
     .option('--contrast <n>', 'contrast multiplier, (0, 5] (default: 1)', '1')
     .option('--brightness <n>', 'brightness offset per channel, -255..255 (default: 0)', '0')
     .option('--char-aspect <n>', 'character cell height/width ratio override')
@@ -73,6 +74,13 @@ function resolveRenderOptions(cmdOpts) {
   }
   o.audioPlayer = o.audioPlayer || undefined;
   o.audio = audioRequested(o);
+  if (o.halfBlocks && o.color === false) {
+    throw new Error('--half-blocks requires color (half-block cells are invisible without it)');
+  }
+  if (o.halfBlocks && o.charAspect == null) {
+    // Half-block cells are ~square (2 stacked pixels), so halve the tall-cell fudge.
+    o.charAspect = DEFAULT_CHAR_ASPECT / 2;
+  }
   return o;
 }
 
@@ -103,11 +111,13 @@ function asciiOptsFor(opts) {
 async function renderOnce(input, opts) {
   const info = await getVideoInfo(input, opts);
   const frameSize = getFrameSize(termSize(), { w: info.w, h: info.h }, opts);
-  const decode = decodeBGRAStream(input, frameSize, { ...opts, realtime: false, frames: 1 });
+  // Half-block mode decodes 2 pixel rows per character row.
+  const decodeSize = opts.halfBlocks ? { w: frameSize.w, h: frameSize.h * 2 } : frameSize;
+  const decode = decodeBGRAStream(input, decodeSize, { ...opts, realtime: false, frames: 1 });
   const decodeError = new Promise((_, reject) => {
     decode.on('error', reject);
   });
-  const dechunk = chunksToRawFramesOfSize(frameSize.w, frameSize.h);
+  const dechunk = chunksToRawFramesOfSize(decodeSize.w, decodeSize.h);
   let frame = null;
   try {
     await Promise.race([
@@ -126,7 +136,10 @@ async function renderOnce(input, opts) {
     const tail = decode.decodeStderr ? decode.decodeStderr() : '';
     throw new Error(`no frames decoded${tail ? `: ${tail}` : ''}`);
   }
-  const ascii = asciiFromBGRA(frame, frameSize.w, asciiOptsFor(opts));
+  const grid = opts.halfBlocks
+    ? halfCellsFromBGRA(frame, frameSize.w)
+    : cellsFromBGRA(frame, frameSize.w, asciiOptsFor(opts));
+  const ascii = cellsToString(grid, opts.color !== false);
   return { ascii, frameSize, info };
 }
 
@@ -318,15 +331,16 @@ async function playStream(input, opts) {
     let firstSpawn = true;
     while (!stopped) {
       const size = getFrameSize(termSize(), { w: info.w, h: info.h }, opts);
-      if (size.w * size.h * 4 > MAX_FRAME_BYTES) {
-        throw new Error(`frame size ${size.w}x${size.h} exceeds memory guard`);
+      const decodeSize = opts.halfBlocks ? { w: size.w, h: size.h * 2 } : size;
+      if (decodeSize.w * decodeSize.h * 4 > MAX_FRAME_BYTES) {
+        throw new Error(`frame size ${decodeSize.w}x${decodeSize.h} exceeds memory guard`);
       }
       resizePending = false;
       // Fresh decode starts at frame 0: restart timestamps and force a full draw.
       sched = createScheduler({ fps: opts.fps ?? info.fps, duration: info.duration });
       prevGrid = null;
       if (paused) sched.pause();
-      decode = decodeBGRAStream(input, size, opts);
+      decode = decodeBGRAStream(input, decodeSize, opts);
       const spawnFailed = new Promise((_, reject) => decode.once('error', reject));
       // Surface a missing binary immediately instead of hanging on stdout.
       await Promise.race([
@@ -337,7 +351,7 @@ async function playStream(input, opts) {
         spawnFailed,
       ]);
 
-      const dechunk = chunksToRawFramesOfSize(size.w, size.h);
+      const dechunk = chunksToRawFramesOfSize(decodeSize.w, decodeSize.h);
       let decodeExited = null;
       decode.once('close', (code) => {
         decodeExited = code;
@@ -359,8 +373,12 @@ async function playStream(input, opts) {
           }
           const asciiOpts = asciiOptsFor(opts);
           const colored = opts.color !== false;
+          const makeGrid = () =>
+            opts.halfBlocks
+              ? halfCellsFromBGRA(frame, size.w)
+              : cellsFromBGRA(frame, size.w, asciiOpts);
           let grid = null;
-          const getGrid = () => (grid ??= cellsFromBGRA(frame, size.w, asciiOpts));
+          const getGrid = () => (grid ??= makeGrid());
           if (display) {
             if (useDiff) {
               const g = getGrid();
@@ -384,7 +402,12 @@ async function playStream(input, opts) {
             }
           }
           if (outFd) {
-            const text = grid ? cellsToString(grid, colored) : asciiFromBGRA(frame, size.w, asciiOpts);
+            // Prefer the already-rendered grid; in half-block mode the grid
+            // is the only correct source (asciiFromBGRA renders 1px cells).
+            let text;
+            if (grid) text = cellsToString(grid, colored);
+            else if (opts.halfBlocks) text = cellsToString(getGrid(), colored);
+            else text = asciiFromBGRA(frame, size.w, asciiOpts);
             await outFd.write(`${stripAnsi(text)}\n\x0c\n`);
           }
           frames++;

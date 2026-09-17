@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { cellsFromBGRA, stripAnsi } = require('../lib/ascii');
+const { cellsFromBGRA, halfCellsFromBGRA, stripAnsi } = require('../lib/ascii');
 const { diffGrids, runsToAnsi } = require('../lib/diff');
 
 const px = (r, g, b) => [b, g, r, 255];
@@ -54,7 +54,7 @@ test('color-only change is detected', () => {
   assert.equal(d.changed, 1);
   const out = runsToAnsi(d.runs, true);
   assert.match(out, /\x1b\[38;2;200;50;50m/);
-  assert.ok(out.endsWith('\x1b[39m'));
+  assert.ok(out.endsWith('\x1b[0m'));
 });
 
 test('runs reconstruct the next frame (randomized roundtrip)', () => {
@@ -99,4 +99,43 @@ test('dimension mismatch throws (caller must full-redraw)', () => {
   const a = grid([[0, 0, 0]], 1);
   const b = grid([[0, 0, 0], [0, 0, 0]], 2);
   assert.throws(() => diffGrids(a, b), /full redraw required/);
+});
+
+test('bg-only change is detected and re-emitted', () => {
+  const top = [...px(10, 10, 10)];
+  const mk = (b) => halfCellsFromBGRA(Buffer.from([...top, ...px(...b)]), 1);
+  const a = mk([0, 0, 0]);
+  const b = mk([200, 0, 0]);
+  const d = diffGrids(a, b);
+  assert.equal(d.changed, 1);
+  const out = runsToAnsi(d.runs, true);
+  assert.match(out, /\x1b\[48;2;200;0;0m/);
+  assert.ok(out.endsWith('\x1b[0m'));
+  assert.equal(stripAnsi(out), '▀');
+});
+
+test('bg presence mismatch counts every cell changed', () => {
+  const a = grid([[0, 0, 0], [0, 0, 0]], 2);
+  const b = halfCellsFromBGRA(
+    Buffer.from([...px(0, 0, 0), ...px(0, 0, 0), ...px(0, 0, 0), ...px(0, 0, 0)]),
+    2
+  );
+  assert.equal(a.width, b.width);
+  assert.equal(a.height, b.height);
+  const d = diffGrids(a, b);
+  assert.equal(d.changed, d.total);
+});
+
+test('half-block grids roundtrip through runs', () => {
+  const mk = (v) =>
+    halfCellsFromBGRA(
+      Buffer.from([v, v, v, 255, 255 - v, 0, v, 255, v, v, v, 255, 0, v, 255, 255]),
+      2
+    );
+  const a = mk(10);
+  const b = mk(200);
+  const d = diffGrids(a, b);
+  assert.ok(d.changed > 0);
+  const out = runsToAnsi(d.runs, true);
+  assert.equal(stripAnsi(out).replace(/\x1b\[[0-9;]*H/g, ''), '▀▀');
 });

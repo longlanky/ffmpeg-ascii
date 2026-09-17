@@ -28,6 +28,7 @@ Common options (both commands):
 | `--color` / `--no-color` | color | ANSI truecolor foreground per character |
 | `--invert` | off | reverse ramp (negative image) |
 | `--dither` | off | Bayer ordered dithering (less banding, more texture) |
+| `--half-blocks` | off | hi-density cells: 2 pixel rows per `▀` cell (fg=top, bg=bottom, needs color; `--chars`/`--invert`/`--dither` don't apply) |
 | `--contrast <n>` | `1` | range (0, 5] |
 | `--brightness <n>` | `0` | per-channel offset -255..255 |
 | `--char-aspect <n>` | `~0.43` | character cell ratio override |
